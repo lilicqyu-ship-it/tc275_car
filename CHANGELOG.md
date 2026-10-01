@@ -7,6 +7,9 @@
 
 ## [未发布]
 
+### 修复
+- 标定存储写序列加固，修复"0x70 标定后 TC275 挂死（掉电不恢复）"：擦除前补 `clearStatus`——FSR 错误锁存会让 FMU 静默拒擦、而逐页编程照常执行，对未擦除扇区二次编程产生 ECC 损坏页，`CALIB_init` 启动读取该页即触发 CPU0 同步错误 trap（位于三核同步事件之前，CPU1/CPU2 永远等在 sync），三核全挂；每步擦/编后检查 `FSR.OPER/PROER`；扇区擦除确认（首字节 0xFF）后才允许编程；写失败重试由无限次改为 3 次上限，放弃时串口打 `CALSAVE failed (flash)` / `CALCLEAR failed (flash)`（doc 34 V1.5）
+
 ## [1.0.0] - 2026-10-01
 
 首个稳定版，对齐 `mw/app_version.h` 1.0.0。

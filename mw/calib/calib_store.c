@@ -41,11 +41,20 @@
 #define CALIB_ACT_WRITE  1u
 #define CALIB_ACT_ERASE  2u
 
+/* A deferred operation gives up after this many failed flash attempts
+ * (doc 34 SS11.4 C6 traded an unbounded retry for "the result must not be
+ * lost silently" - but every attempt is a new erase/program cycle on the
+ * single slot, and a persistently failing FMU then hammers it every
+ * CALIB_WRITE_IDLE_MS forever. Bounded now: the live record stays applied
+ * in RAM and the console line says why it never reached DFlash.) */
+#define CALIB_FLASH_RETRIES  3u
+
 typedef struct
 {
     uint8       action;          /* CALIB_ACT_*                               */
     CalibRecord rec;
     uint32      quietMs;         /* earliest moment a write may start         */
+    uint8       attempts;        /* failed flash attempts so far              */
 } PendingWrite;
 
 static PendingWrite g_pending;
@@ -55,9 +64,10 @@ static PendingWrite g_pending;
  * a failed flash operation. */
 static void calib_queueWrite(uint8 action, const CalibRecord *rec)
 {
-    g_pending.action  = action;
-    g_pending.rec     = *rec;
-    g_pending.quietMs = STIME_nowMs();
+    g_pending.action   = action;
+    g_pending.rec      = *rec;
+    g_pending.quietMs  = STIME_nowMs();
+    g_pending.attempts = 0u;
 }
 
 static void calib_delayWrite(void)
@@ -92,6 +102,25 @@ static boolean calib_flashWaitD0(void)
     return TRUE;
 }
 
+/* Wait for the FMU and vet the outcome: a command the flash rejected
+ * (protection / operation error) leaves D0BUSY clear and the error latched
+ * in FSR, which a bare busy-wait reads as success. Detected here, reported
+ * as a failed operation (same contract flash_ota.c's flashota_waitBank
+ * uses on the PFlash banks). */
+static boolean calib_flashOpOk(void)
+{
+    if (calib_flashWaitD0() == FALSE)
+    {
+        return FALSE;
+    }
+    if ((FLASH0_FSR.B.OPER != 0u) || (FLASH0_FSR.B.PROER != 0u))
+    {
+        IfxFlash_clearStatus(0u);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* Erase + program the blob into the slot, then read the record bytes back.
  * iLLD gives a 20 B record and an 8 B DFlash page (IFXFLASH_DFLASH_PAGE_
  * LENGTH), and ECC is computed per page, so the blob is programmed one page
@@ -109,7 +138,7 @@ static boolean calib_flashWritePage(uint32 pageAddr, const uint8 *bytes)
     ok = (IfxFlash_enterPageMode(pageAddr) == 0u);
     if (ok != FALSE)
     {
-        ok = calib_flashWaitD0();      /* page mode must not race the erase */
+        ok = calib_flashOpOk();         /* page mode must not race the erase */
     }
     if (ok != FALSE)
     {
@@ -117,7 +146,7 @@ static boolean calib_flashWritePage(uint32 pageAddr, const uint8 *bytes)
                           (uint32)CALIBREC_getI32(&bytes[0]),
                           (uint32)CALIBREC_getI32(&bytes[4]));
         IfxFlash_writePage(pageAddr);
-        ok = calib_flashWaitD0();
+        ok = calib_flashOpOk();
     }
     IfxFlash_clearStatus(0u);
     return ok;
@@ -172,7 +201,19 @@ static uint8 g_opBlob[CALIB_REC_BLOB_LEN];
  * back -> unmask -> feed. Called from the robot task, never from a critical
  * section, so the plain mask/unmask is safe here. The masked window is tens
  * of ms in practice (bounded by CALIB_FLASH_TIMEOUT_MS per operation); CPU0
- * is the only core that fetches from DFlash, so CPU1/CPU2 do not stall. */
+ * is the only core that fetches from DFlash, so CPU1/CPU2 do not stall.
+ *
+ * Ordering is load-bearing against the bench "calibrate once, TC275 dead"
+ * failure: with a status flag latched (a rejected earlier command), the FMU
+ * silently ignores the erase while the per-page sequences below - each
+ * starting with their own clearStatus - still execute, programming pages of
+ * a sector that was never erased. Reprogramming a live DFlash page corrupts
+ * its ECC, and every later read of the slot (the verify here, CALIB_init at
+ * each boot) takes a synchronous-data-error trap on CPU0 - before the CPU
+ * sync event at boot, hanging all three cores. So: clear the status before
+ * the erase, check FSR after every command, and only ever program a sector
+ * that verifiably reads erased (DFlash erase level = 0xFF, per the SBL's
+ * own DFlash meta magic check on a fresh bank). */
 static boolean calib_flashSave(const CalibRecord *rec)
 {
     boolean ok;
@@ -181,8 +222,13 @@ static boolean calib_flashSave(const CalibRecord *rec)
 
     WDG_serviceCpu();
     __disable();
+    IfxFlash_clearStatus(0u);
     IfxFlash_eraseSector(CALIB_SECTOR_ADDR);
-    ok = calib_flashWaitD0();
+    ok = calib_flashOpOk();
+    if (ok != FALSE)
+    {
+        ok = (*(volatile uint8 *)CALIB_SECTOR_ADDR == 0xFFu) ? TRUE : FALSE;
+    }
     if (ok != FALSE)
     {
         ok = calib_flashWrite(g_opBlob);
@@ -198,8 +244,9 @@ static boolean calib_flashErase(void)
 
     WDG_serviceCpu();
     __disable();
+    IfxFlash_clearStatus(0u);
     IfxFlash_eraseSector(CALIB_SECTOR_ADDR);
-    ok = calib_flashWaitD0();
+    ok = calib_flashOpOk();
     __enable();
     WDG_serviceCpu();
     return ok;
@@ -409,6 +456,14 @@ void CALIB_tick(void)
         {
             g_pending.action = CALIB_ACT_IDLE;
         }
+        else if (++g_pending.attempts >= CALIB_FLASH_RETRIES)
+        {
+            /* Give up, loudly: the live record already answered with the
+             * defaults, but a stale DFlash copy would resurface at the next
+             * boot. The console line is the bench operator's cue. */
+            g_pending.action = CALIB_ACT_IDLE;
+            XCORE_logln("CALCLEAR failed (flash)");
+        }
         else
         {
             calib_delayWrite();
@@ -431,6 +486,14 @@ void CALIB_tick(void)
         if (saved == CALIB_SAVED_WRITTEN)
         {
             g_pending.action = CALIB_ACT_IDLE;
+        }
+        else if (++g_pending.attempts >= CALIB_FLASH_RETRIES)
+        {
+            /* Give up, loudly: the calibrated record stays applied in RAM
+             * (signs, closed-loop gate) for this power cycle only; the
+             * result frame already went out with saved=2. */
+            g_pending.action = CALIB_ACT_IDLE;
+            XCORE_logln("CALSAVE failed (flash)");
         }
         else
         {
